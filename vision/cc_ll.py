@@ -1,16 +1,36 @@
-import cv2
+#!/usr/bin/env python3
+"""
+===============================================================================
+Project: Vision-Based Gesture-Controlled Person-Following Robot
+File: vision/cc_ll.py
+Description: Production-hardened Low-Latency Vision Controller.
+             Features:
+             - CLI parameterization (--camera 0 or --camera http://IP:8080/video)
+             - Automatic fallback from network MJPEG to local USB camera
+             - Cold-start capability: Starts IDLE even if gesture_model.pkl is missing
+             - Pair target using purely geometric closed-fist heuristic
+             - Automatic on-the-fly model training via sys.executable
+             - Persistent Unix domain socket connections with auto-reconnect
+             - Bounding-box to wrist association for target exclusivity
+===============================================================================
+"""
+
+import argparse
 import csv
 import json
-import time
-import os
 import math
-import joblib
-import numpy as np
-import subprocess
+import os
 import socket
+import subprocess
+import sys
 import threading
+import time
 import urllib.request
+
+import cv2
+import joblib
 import mediapipe as mp
+import numpy as np
 
 try:
     from ultralytics import YOLO
@@ -20,41 +40,31 @@ except ImportError:
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
+# Local imports
 from gesture_features import extract_features
 
-GESTURE_DATA_DIR = "gesture_data"
-HAND_MODEL_PATH = "hand_landmarker.task"
-MODEL_PATH = "gesture_model.pkl"
+# =============================================================================
+# CONSTANTS & CONFIGURATION
+# =============================================================================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+GESTURE_DATA_DIR = os.path.join(SCRIPT_DIR, "gesture_data")
+HAND_MODEL_PATH = os.path.join(SCRIPT_DIR, "hand_landmarker.task")
+MODEL_PATH = os.path.join(SCRIPT_DIR, "gesture_model.pkl")
+PERSON_MODEL_PATH = os.path.join(SCRIPT_DIR, "yolo11n.pt")
 
-GESTURE_DURATION = 10
+GESTURES = ["FOLLOW", "STOP", "DOCK"]
+PAIRING_HOLD_TIME = 3.0
+GESTURE_CONFIRMATION_TIME = 1.0
+REJECTION_GRACE_TIME = 0.3
+RECALIBRATION_COUNTDOWN = 3.0
+GESTURE_RECORD_DURATION = 8.0
 SAMPLE_RATE = 20
 SAMPLE_INTERVAL = 1.0 / SAMPLE_RATE
 
-GESTURES = ["FOLLOW", "STOP", "DOCK"]
-
-RECALIBRATION_COUNTDOWN = 5.0
-GESTURE_CONFIRMATION_TIME = 1.0
-REJECTION_GRACE_TIME = 0.3
-
-# Time a CLOSED FIST must be held (while IDLE) to lock in a new target.
-PAIRING_HOLD_TIME = 3.0
-
-# Person tracker settings.
-# YOLO detects people and ByteTrack maintains a temporary ID for each person.
-# Gesture recognition is accepted only when the detected hand belongs to the
-# locked target person's tracked ID.
-PERSON_MODEL_PATH = "yolo11n.pt"
-PERSON_TRACKER_CONFIG = "bytetrack.yaml"
-PERSON_CLASS_ID = 0
-# Unix socket used to send confirmed gestures to the ROS 2 bridge.
 GESTURE_SOCKET_PATH = "/tmp/vbgc_gesture.sock"
-
-# Unix socket used to send the locked target position to the ROS 2 bridge.
 TARGET_SOCKET_PATH = "/tmp/vbgc_target.sock"
-TARGET_PUBLISH_INTERVAL = 0.10
+TARGET_PUBLISH_INTERVAL = 0.08  # ~12.5 Hz
 
-# Approximate monocular-camera distance model.
-# These values are configurable and should be tuned for the final camera.
 ASSUMED_PERSON_HEIGHT_METERS = 1.70
 CAMERA_FOCAL_LENGTH_PIXELS = 600.0
 MIN_TARGET_DISTANCE = 0.50
@@ -63,48 +73,63 @@ MAX_TARGET_DISTANCE = 5.00
 os.makedirs(GESTURE_DATA_DIR, exist_ok=True)
 
 
-base_options = python.BaseOptions(
-    model_asset_path=HAND_MODEL_PATH
-)
+# =============================================================================
+# VIDEO STREAMING PRIMITIVES
+# =============================================================================
+class ResilientCameraStream:
+    """Combines a threaded MJPEG reader with fallback to standard V4L2 USB camera."""
 
-options = vision.HandLandmarkerOptions(
-    base_options=base_options,
-    num_hands=1,
-    min_hand_detection_confidence=0.5,
-    min_hand_presence_confidence=0.5,
-    min_tracking_confidence=0.5
-)
-
-landmarker = vision.HandLandmarker.create_from_options(options)
-
-class LowLatencyMJPEGCamera:
-    """Read the newest JPEG frame from the Raspberry Pi MJPEG stream."""
-
-    def __init__(self, url):
-        self.url = url
+    def __init__(self, source):
+        self.source = source
+        self.is_url = str(source).startswith("http://") or str(source).startswith("https://")
         self.frame = None
         self.lock = threading.Lock()
         self.running = False
         self.thread = None
-        self.response = None
+        self.cap_local = None
 
     def start(self):
-        try:
-            self.response = urllib.request.urlopen(self.url, timeout=5)
-        except Exception as exc:
-            print(f"Could not open camera stream: {exc}")
+        if self.is_url:
+            print(f"[INFO] Connecting to MJPEG network stream at {self.source}...")
+            self.running = True
+            self.thread = threading.Thread(target=self._mjpeg_worker, daemon=True)
+            self.thread.start()
+            # Wait up to 3 seconds for first frame
+            start_wait = time.time()
+            while time.time() - start_wait < 3.0:
+                with self.lock:
+                    if self.frame is not None:
+                        print("[OK] Connected to network MJPEG camera stream.")
+                        return True
+                time.sleep(0.1)
+
+            print("[WARN] MJPEG stream failed to respond. Falling back to USB Camera (/dev/video0)...")
+            self.running = False
+
+        # Fallback to local OpenCV camera
+        cam_idx = 0
+        if not self.is_url:
+            try:
+                cam_idx = int(self.source)
+            except ValueError:
+                cam_idx = 0
+
+        self.cap_local = cv2.VideoCapture(cam_idx)
+        if not self.cap_local.isOpened():
+            print(f"[ERROR] Could not open local camera index {cam_idx}")
             return False
 
-        self.running = True
-        self.thread = threading.Thread(target=self._reader, daemon=True)
-        self.thread.start()
+        print(f"[OK] Opened local camera index {cam_idx}")
         return True
 
-    def _reader(self):
-        buffer = b""
+    def _mjpeg_worker(self):
         try:
+            req = urllib.request.Request(self.source, headers={"User-Agent": "Mozilla/5.0"})
+            stream = urllib.request.urlopen(req, timeout=4)
+            buffer = b""
+
             while self.running:
-                chunk = self.response.read(4096)
+                chunk = stream.read(4096)
                 if not chunk:
                     break
                 buffer += chunk
@@ -122,23 +147,23 @@ class LowLatencyMJPEGCamera:
                             buffer = buffer[start:]
                         break
 
-                    jpg = buffer[start:end + 2]
-                    buffer = buffer[end + 2:]
+                    jpg = buffer[start : end + 2]
+                    buffer = buffer[end + 2 :]
 
-                    decoded = cv2.imdecode(
-                        np.frombuffer(jpg, dtype=np.uint8),
-                        cv2.IMREAD_COLOR
-                    )
+                    decoded = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
                     if decoded is not None:
                         with self.lock:
                             self.frame = decoded
         except Exception as exc:
-            if self.running:
-                print(f"Camera stream error: {exc}")
+            print(f"[WARN] MJPEG stream disconnected: {exc}")
         finally:
             self.running = False
 
     def read(self):
+        if self.cap_local is not None:
+            ret, frame = self.cap_local.read()
+            return ret, frame
+
         with self.lock:
             if self.frame is None:
                 return False, None
@@ -146,1069 +171,492 @@ class LowLatencyMJPEGCamera:
 
     def release(self):
         self.running = False
-        try:
-            if self.response is not None:
-                self.response.close()
-        except Exception:
-            pass
-        if self.thread is not None and self.thread.is_alive():
+        if self.thread and self.thread.is_alive():
             self.thread.join(timeout=1.0)
+        if self.cap_local:
+            self.cap_local.release()
 
 
-cap = LowLatencyMJPEGCamera("http://172.16.61.125:8080/video")
+# =============================================================================
+# PERSISTENT UNIX SOCKET CLIENT
+# =============================================================================
+class PersistentSocketClient:
+    """Maintains a persistent socket connection to prevent connection churn."""
 
-if not cap.start():
-    landmarker.close()
-    exit()
+    def __init__(self, path):
+        self.path = path
+        self.sock = None
+
+    def connect(self):
+        if not os.path.exists(self.path):
+            return False
+        try:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(0.1)
+            self.sock.connect(self.path)
+            return True
+        except (socket.error, OSError):
+            self.sock = None
+            return False
+
+    def send(self, payload_str):
+        if self.sock is None:
+            if not self.connect():
+                return False
+        try:
+            self.sock.sendall(payload_str.encode("utf-8"))
+            return True
+        except (socket.error, BrokenPipeError, ConnectionResetError):
+            self.close()
+            return False
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
 
 
-if YOLO is None:
-    print("Ultralytics is not installed.")
-    print("Install it with: pip install ultralytics")
-    landmarker.close()
-    cap.release()
-    exit()
-
-
-print("Loading person tracker...")
-person_tracker = YOLO(PERSON_MODEL_PATH)
-print("Person tracker loaded.")
-
-
-connections = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (0, 9), (9, 10), (10, 11), (11, 12),
-    (0, 13), (13, 14), (14, 15), (15, 16),
-    (0, 17), (17, 18), (18, 19), (19, 20),
-    (5, 9), (9, 13), (13, 17)
-]
-
-
+# =============================================================================
+# GESTURE & TRACKING UTILITIES
+# =============================================================================
 def is_closed_fist(hand):
-    finger_pairs = [
-        (8, 6),
-        (12, 10),
-        (16, 14),
-        (20, 18)
-    ]
-
-    folded_fingers = 0
-
-    for tip, pip in finger_pairs:
-        if hand[tip].y > hand[pip].y:
-            folded_fingers += 1
+    """Purely geometric heuristic to detect a closed fist. Does NOT require ML model."""
+    finger_pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
+    folded_fingers = sum(1 for tip, pip in finger_pairs if hand[tip].y > hand[pip].y)
 
     index_mcp = hand[5]
     pinky_mcp = hand[17]
     thumb_tip = hand[4]
 
-    palm_width = (
-        ((index_mcp.x - pinky_mcp.x) ** 2 +
-         (index_mcp.y - pinky_mcp.y) ** 2) ** 0.5
-    )
-
-    thumb_to_index = (
-        ((thumb_tip.x - index_mcp.x) ** 2 +
-         (thumb_tip.y - index_mcp.y) ** 2) ** 0.5
-    )
-
-    thumb_to_pinky = (
-        ((thumb_tip.x - pinky_mcp.x) ** 2 +
-         (thumb_tip.y - pinky_mcp.y) ** 2) ** 0.5
-    )
-
+    palm_width = math.hypot(index_mcp.x - pinky_mcp.x, index_mcp.y - pinky_mcp.y)
     if palm_width < 1e-8:
         return False
 
-    thumb_folded = (
-        thumb_to_index < palm_width * 0.9 and
-        thumb_to_pinky < palm_width * 0.9
-    )
+    thumb_to_index = math.hypot(thumb_tip.x - index_mcp.x, thumb_tip.y - index_mcp.y)
+    thumb_to_pinky = math.hypot(thumb_tip.x - pinky_mcp.x, thumb_tip.y - pinky_mcp.y)
 
-    return folded_fingers == 4 and thumb_folded
-
-
-def draw_hand(frame, hand):
-    for landmark in hand:
-        x = int(landmark.x * frame.shape[1])
-        y = int(landmark.y * frame.shape[0])
-        cv2.circle(frame, (x, y), 3, (0, 255, 0), -1)
-
-    for start, end in connections:
-        x1 = int(hand[start].x * frame.shape[1])
-        y1 = int(hand[start].y * frame.shape[0])
-
-        x2 = int(hand[end].x * frame.shape[1])
-        y2 = int(hand[end].y * frame.shape[0])
-
-        cv2.line(
-            frame,
-            (x1, y1),
-            (x2, y2),
-            (0, 255, 0),
-            2
-        )
-
-
-def put_text(frame, text, y, scale=0.7):
-    cv2.putText(
-        frame,
-        text,
-        (20, y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        scale,
-        (255, 255, 255),
-        2
-    )
-
-
-def load_model():
-    if not os.path.exists(MODEL_PATH):
-        print("Gesture model not found.")
-        print("Run train_gesture_model.py first.")
-        return None
-
-    return joblib.load(MODEL_PATH)
-
-
-def predict_gesture(hand, model_data):
-    model = model_data["model"]
-    training_features = model_data["training_features"]
-    training_labels = model_data["training_labels"]
-    distance_thresholds = model_data["distance_thresholds"]
-    K = model_data["distance_k"]
-
-    features = np.array(
-        extract_features(hand),
-        dtype=np.float32
-    )
-
-    probabilities = model.predict_proba([features])[0]
-
-    prediction_index = probabilities.argmax()
-
-    candidate = model.classes_[prediction_index]
-
-    confidence = probabilities[prediction_index]
-
-    class_samples = training_features[
-        training_labels == candidate
-    ]
-
-    distances = np.linalg.norm(
-        class_samples - features,
-        axis=1
-    )
-
-    k = min(K, len(distances))
-
-    nearest_distances = np.sort(distances)[:k]
-
-    distance = np.mean(nearest_distances)
-
-    threshold = distance_thresholds[candidate]
-
-    if distance <= threshold:
-        prediction = candidate
-    else:
-        prediction = "REJECTED"
-
-    return prediction, confidence, distance, threshold
-
-
-def hand_position(hand):
-    # Wrist landmark. Chosen over an all-landmark centroid because the wrist
-    # stays relatively stable across different gestures (fingers move a lot,
-    # the wrist doesn't), which makes it a steadier anchor for "is this the
-    # same person's hand as before".
-    wrist = hand[0]
-    return (wrist.x, wrist.y)
-
-
-def position_distance(p1, p2):
-    return (
-        (p1[0] - p2[0]) ** 2 +
-        (p1[1] - p2[1]) ** 2
-    ) ** 0.5
-
-
-def track_people(frame):
-    """Run person detection + ByteTrack and return tracked people."""
-    results = person_tracker.track(
-        frame,
-        persist=True,
-        classes=[PERSON_CLASS_ID],
-        tracker=PERSON_TRACKER_CONFIG,
-        verbose=False
-    )
-
-    people = []
-
-    if not results:
-        return people
-
-    boxes = results[0].boxes
-
-    if boxes is None or boxes.id is None:
-        return people
-
-    xyxy = boxes.xyxy.cpu().numpy()
-    ids = boxes.id.int().cpu().tolist()
-
-    for box, person_id in zip(xyxy, ids):
-        x1, y1, x2, y2 = box.tolist()
-        people.append({
-            "id": person_id,
-            "box": (x1, y1, x2, y2)
-        })
-
-    return people
+    thumb_folded = (thumb_to_index < palm_width * 0.95) and (thumb_to_pinky < palm_width * 0.95)
+    return (folded_fingers == 4) and thumb_folded
 
 
 def hand_person_id(hand, people, frame_shape):
-    """Associate the detected hand with the person whose box contains its wrist."""
+    """Associates detected hand wrist to the bounding box of a tracked person."""
     height, width = frame_shape[:2]
     wrist_x = hand[0].x * width
     wrist_y = hand[0].y * height
 
     for person in people:
         x1, y1, x2, y2 = person["box"]
-
-        if x1 <= wrist_x <= x2 and y1 <= wrist_y <= y2:
+        # Allow 5% margin around person bounding box
+        pad_x = (x2 - x1) * 0.05
+        pad_y = (y2 - y1) * 0.05
+        if (x1 - pad_x) <= wrist_x <= (x2 + pad_x) and (y1 - pad_y) <= wrist_y <= (y2 + pad_y):
             return person["id"]
-
     return None
 
 
-def draw_people(frame, people, target_id=None):
-    """Draw tracked person boxes so target-ID behavior can be visually verified."""
-    for person in people:
-        x1, y1, x2, y2 = [int(v) for v in person["box"]]
-        person_id = person["id"]
+def predict_gesture(hand, model_data):
+    """Classifies hand pose with open-set k-NN distance rejection."""
+    if model_data is None:
+        return "MODEL_NOT_TRAINED", 0.0, 0.0, 0.0
 
-        thickness = 3 if person_id == target_id else 1
+    model = model_data["model"]
+    training_features = model_data["training_features"]
+    training_labels = model_data["training_labels"]
+    distance_thresholds = model_data["distance_thresholds"]
+    k_val = model_data.get("distance_k", 5)
 
-        cv2.rectangle(
-            frame,
-            (x1, y1),
-            (x2, y2),
-            (255, 0, 255),
-            thickness
-        )
+    features = np.array(extract_features(hand), dtype=np.float32)
+    probabilities = model.predict_proba([features])[0]
+    pred_idx = probabilities.argmax()
+    candidate = model.classes_[pred_idx]
+    confidence = float(probabilities[pred_idx])
 
-        label = (
-            f"TARGET ID {person_id}"
-            if person_id == target_id
-            else f"Person {person_id}"
-        )
+    class_samples = training_features[training_labels == candidate]
+    distances = np.linalg.norm(class_samples - features, axis=1)
+    k = min(k_val, len(distances))
+    distance = float(np.mean(np.sort(distances)[:k]))
+    threshold = float(distance_thresholds.get(candidate, 0.5))
 
-        cv2.putText(
-            frame,
-            label,
-            (x1, max(20, y1 - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            2
-        )
-
-def send_gesture_to_ros(gesture):
-    """Send a confirmed gesture to the ROS 2 gesture publisher."""
-    if gesture not in GESTURES:
-        return False
-
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as gesture_socket:
-            gesture_socket.settimeout(1.0)
-            gesture_socket.connect(GESTURE_SOCKET_PATH)
-            gesture_socket.sendall(
-                (gesture + "\n").encode("utf-8")
-            )
-
-        print(f"ROS 2 gesture sent: {gesture}")
-        return True
-
-    except (
-        FileNotFoundError,
-        ConnectionRefusedError,
-        TimeoutError,
-        BrokenPipeError,
-        ConnectionResetError,
-        OSError,
-    ):
-        print(
-            f"Could not connect to ROS 2 gesture publisher at "
-            f"{GESTURE_SOCKET_PATH}"
-        )
-        return False
-
-def send_target_to_ros(person_box, frame_shape):
-    """Estimate camera-relative target position and send it to the ROS 2 bridge."""
-    try:
-        x1, y1, x2, y2 = person_box
-        frame_height, frame_width = frame_shape[:2]
-
-        box_height = max(1.0, y2 - y1)
-        box_center_x = (x1 + x2) / 2.0
-
-        # Monocular distance estimate from apparent person height.
-        distance = (
-            ASSUMED_PERSON_HEIGHT_METERS * CAMERA_FOCAL_LENGTH_PIXELS
-        ) / box_height
-
-        distance = max(
-            MIN_TARGET_DISTANCE,
-            min(MAX_TARGET_DISTANCE, distance)
-        )
-
-        # Pixel offset from image center gives the target bearing.
-        # Positive ROS y is treated as left of the rover.
-        pixel_offset_x = box_center_x - (frame_width / 2.0)
-        angle = math.atan2(
-            -pixel_offset_x,
-            CAMERA_FOCAL_LENGTH_PIXELS
-        )
-
-        target_x = distance * math.cos(angle)
-        target_y = distance * math.sin(angle)
-
-        message = {
-            "x": target_x,
-            "y": target_y
-        }
-
-        with socket.socket(
-            socket.AF_UNIX,
-            socket.SOCK_STREAM
-        ) as target_socket:
-            target_socket.settimeout(0.2)
-            target_socket.connect(TARGET_SOCKET_PATH)
-            target_socket.sendall(
-                (json.dumps(message) + "\n").encode("utf-8")
-            )
-
-        return True
-
-    except (
-        FileNotFoundError,
-        ConnectionRefusedError,
-        TimeoutError,
-        BrokenPipeError,
-        ConnectionResetError,
-        OSError,
-    ):
-        return False
+    prediction = candidate if distance <= threshold else "REJECTED"
+    return prediction, confidence, distance, threshold
 
 
-def run_calibration():
+def run_calibration(cap, landmarker, yolo_tracker):
+    """Interactive calibration: records samples for FOLLOW, STOP, DOCK and trains model."""
+    print("\n" + "=" * 60 + "\n  INTERACTIVE GESTURE CALIBRATION ACTIVATED\n" + "=" * 60)
 
-    print()
-    print("=" * 50)
-    print("RECALIBRATION STARTED")
-    print("=" * 50)
-    print()
-
-    countdown_start = time.time()
-
-    while time.time() - countdown_start < RECALIBRATION_COUNTDOWN:
-
+    # 3-second ready countdown
+    start_t = time.time()
+    while time.time() - start_t < RECALIBRATION_COUNTDOWN:
         ret, frame = cap.read()
-
         if not ret:
             return False
-
         frame = cv2.flip(frame, 1)
-        track_people(frame)
-
-        remaining = (
-            RECALIBRATION_COUNTDOWN -
-            (time.time() - countdown_start)
-        )
-
-        put_text(
+        rem = RECALIBRATION_COUNTDOWN - (time.time() - start_t)
+        cv2.putText(
             frame,
-            "RECALIBRATION STARTING",
-            60,
-            0.9
+            "GET READY TO CALIBRATE",
+            (20, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2,
         )
-
-        put_text(
+        cv2.putText(
             frame,
-            f"Starting in {remaining:.1f}s",
-            110,
-            0.9
+            f"Starting in {rem:.1f}s",
+            (20, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
         )
-
-        put_text(
-            frame,
-            "Prepare FOLLOW gesture",
-            160,
-            0.7
-        )
-
-        cv2.imshow(
-            "Gesture Controller",
-            frame
-        )
-
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord("q") or key == 27:
+        cv2.imshow("Gesture Controller", frame)
+        if cv2.waitKey(1) & 0xFF == 27:
             return False
 
     for gesture in GESTURES:
-
-        print()
-        print("=" * 40)
-        print(f"Prepare gesture: {gesture}")
-        print("=" * 40)
-        print("Recording starts in 2 seconds.")
-        print("Keep the same gesture.")
-        print("Vary position, distance and orientation.")
-        print()
-
-        countdown_start = time.time()
-
-        while time.time() - countdown_start < 2:
-
-            ret, frame = cap.read()
-
-            if not ret:
-                return False
-
-            frame = cv2.flip(frame, 1)
-            track_people(frame)
-
-            remaining = (
-                2 -
-                (time.time() - countdown_start)
-            )
-
-            put_text(
-                frame,
-                f"Gesture: {gesture}",
-                45,
-                0.9
-            )
-
-            put_text(
-                frame,
-                f"Starting in {remaining:.1f}s",
-                85,
-                0.8
-            )
-
-            put_text(
-                frame,
-                "Press Q or ESC to quit",
-                120,
-                0.6
-            )
-
-            cv2.imshow(
-                "Gesture Controller",
-                frame
-            )
-
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord("q") or key == 27:
-                return False
-
+        print(f"[INFO] Recording gesture: {gesture}")
         samples = []
+        start_rec = time.time()
+        last_sample = 0.0
 
-        start_time = time.time()
-        last_sample_time = 0
-
-        while time.time() - start_time < GESTURE_DURATION:
-
+        while time.time() - start_rec < GESTURE_RECORD_DURATION:
             ret, frame = cap.read()
-
             if not ret:
                 return False
-
             frame = cv2.flip(frame, 1)
-            track_people(frame)
+            now = time.time()
+            rem = GESTURE_RECORD_DURATION - (now - start_rec)
 
-            current_time = time.time()
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            res = landmarker.detect(mp_img)
 
-            elapsed = current_time - start_time
+            if res.hand_landmarks:
+                hand = res.hand_landmarks[0]
+                if now - last_sample >= SAMPLE_INTERVAL:
+                    samples.append(extract_features(hand))
+                    last_sample = now
 
-            remaining = max(
-                0,
-                GESTURE_DURATION - elapsed
-            )
-
-            rgb = cv2.cvtColor(
+            cv2.putText(
                 frame,
-                cv2.COLOR_BGR2RGB
+                f"RECORDING: {gesture}",
+                (20, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2,
             )
-
-            mp_image = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=rgb
-            )
-
-            result = landmarker.detect(mp_image)
-
-            if result.hand_landmarks:
-
-                hand = result.hand_landmarks[0]
-
-                draw_hand(frame, hand)
-
-                if (
-                    current_time - last_sample_time
-                    >= SAMPLE_INTERVAL
-                ):
-
-                    features = extract_features(hand)
-
-                    samples.append(features)
-
-                    last_sample_time = current_time
-
-            put_text(
+            cv2.putText(
                 frame,
-                f"Recording: {gesture}",
-                40,
-                0.9
+                f"Time Left: {rem:.1f}s | Samples: {len(samples)}",
+                (20, 90),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
             )
-
-            put_text(
-                frame,
-                f"Time remaining: {remaining:.1f}s",
-                80,
-                0.7
-            )
-
-            put_text(
-                frame,
-                "Move closer/farther, left/right and rotate",
-                115,
-                0.55
-            )
-
-            put_text(
-                frame,
-                "Keep the same gesture",
-                145,
-                0.6
-            )
-
-            put_text(
-                frame,
-                f"Samples: {len(samples)}",
-                180,
-                0.6
-            )
-
-            cv2.imshow(
-                "Gesture Controller",
-                frame
-            )
-
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord("q") or key == 27:
+            cv2.imshow("Gesture Controller", frame)
+            if cv2.waitKey(1) & 0xFF == 27:
                 return False
 
-        output_path = os.path.join(
-            GESTURE_DATA_DIR,
-            f"{gesture}.csv"
-        )
+        csv_path = os.path.join(GESTURE_DATA_DIR, f"{gesture}.csv")
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([f"f{i}" for i in range(63)])
+            writer.writerows(samples)
+        print(f"[OK] Saved {len(samples)} samples to {csv_path}")
 
-        with open(
-            output_path,
-            "w",
-            newline=""
-        ) as file:
+    # Retrain model using active python interpreter
+    train_script = os.path.join(SCRIPT_DIR, "train_gesture_model.py")
+    res = subprocess.run([sys.executable, train_script], cwd=SCRIPT_DIR, text=True)
+    return res.returncode == 0
 
-            writer = csv.writer(file)
 
-            writer.writerow(
-                [f"f{i}" for i in range(63)]
+# =============================================================================
+# MAIN CONTROLLER LOOP
+# =============================================================================
+def main():
+    parser = argparse.ArgumentParser(description="VBGC Robot Vision Controller")
+    parser.add_argument(
+        "--camera",
+        default="http://172.16.61.125:8080/video",
+        help="Camera URL or webcam device index (e.g., '0')",
+    )
+    args = parser.parse_args()
+
+    # Load MediaPipe Hand Landmarker
+    if not os.path.exists(HAND_MODEL_PATH):
+        print(f"[FATAL] Hand landmarker asset missing: {HAND_MODEL_PATH}")
+        sys.exit(1)
+
+    base_opt = python.BaseOptions(model_asset_path=HAND_MODEL_PATH)
+    options = vision.HandLandmarkerOptions(
+        base_options=base_opt,
+        num_hands=1,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    landmarker = vision.HandLandmarker.create_from_options(options)
+
+    # Initialize YOLO Person Tracker
+    person_tracker = None
+    if YOLO is not None and os.path.exists(PERSON_MODEL_PATH):
+        person_tracker = YOLO(PERSON_MODEL_PATH)
+        print("[OK] YOLO11 Person Tracker loaded.")
+    else:
+        print("[WARN] Running without YOLO person tracker (YOLO or weights missing).")
+
+    # Start Video Stream
+    cap = ResilientCameraStream(args.camera)
+    if not cap.start():
+        sys.exit(1)
+
+    # Initialize Persistent Sockets
+    gesture_client = PersistentSocketClient(GESTURE_SOCKET_PATH)
+    target_client = PersistentSocketClient(TARGET_SOCKET_PATH)
+
+    # Attempt to load model (Cold boot allowed!)
+    model_data = None
+    if os.path.exists(MODEL_PATH):
+        try:
+            model_data = joblib.load(MODEL_PATH)
+            print("[OK] Loaded pre-trained gesture model.")
+        except Exception as e:
+            print(f"[WARN] Failed to load {MODEL_PATH}: {e}")
+    else:
+        print("[NOTICE] No gesture_model.pkl found. System started in UNCALIBRATED mode.")
+        print("[NOTICE] Pair with a 3-second CLOSED FIST to begin automatic calibration.")
+
+    state = "IDLE"  # IDLE | ACTIVE
+    target_person_id = None
+    pairing_fist_start_time = None
+    candidate_gesture = None
+    gesture_start_time = None
+    confirmed_gesture = None
+    rejection_start_time = None
+    last_target_publish_time = 0.0
+
+    print("\n" + "=" * 50)
+    print("  VBGC VISION CONTROLLER RUNNING")
+    print("  Show CLOSED FIST for 3s to Pair/Calibrate")
+    print("  Press 'C' when IDLE to force recalibration")
+    print("  Press 'Q' or ESC to Quit")
+    print("=" * 50 + "\n")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            time.sleep(0.01)
+            continue
+
+        frame = cv2.flip(frame, 1)
+        h, w = frame.shape[:2]
+
+        # 1. Track People with YOLO
+        people = []
+        if person_tracker is not None:
+            res_yolo = person_tracker.track(
+                frame, persist=True, classes=[0], tracker="bytetrack.yaml", verbose=False
+            )
+            if res_yolo and res_yolo[0].boxes and res_yolo[0].boxes.id is not None:
+                boxes = res_yolo[0].boxes.xyxy.cpu().numpy()
+                p_ids = res_yolo[0].boxes.id.int().cpu().tolist()
+                for b, pid in zip(boxes, p_ids):
+                    people.append({"id": pid, "box": b.tolist()})
+
+        # Draw Person Bounding Boxes
+        for p in people:
+            bx1, by1, bx2, by2 = [int(v) for v in p["box"]]
+            is_tgt = (p["id"] == target_person_id)
+            color = (0, 255, 0) if is_tgt else (255, 100, 0)
+            thick = 3 if is_tgt else 1
+            cv2.rectangle(frame, (bx1, by1), (bx2, by2), color, thick)
+            label = f"TARGET ID: {p['id']}" if is_tgt else f"Person {p['id']}"
+            cv2.putText(
+                frame, label, (bx1, max(20, by1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2
             )
 
-            writer.writerows(samples)
+        # 2. Detect Hands with MediaPipe
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        mp_res = landmarker.detect(mp_img)
 
-        print(
-            f"{gesture}: saved {len(samples)} samples"
-        )
+        hand_detected = bool(mp_res.hand_landmarks)
+        hand = mp_res.hand_landmarks[0] if hand_detected else None
+        fist_detected = is_closed_fist(hand) if hand else False
+        current_pid = hand_person_id(hand, people, frame.shape) if hand else None
 
-    print()
-    print("=" * 50)
-    print("Calibration complete")
-    print("=" * 50)
-    print()
+        now = time.time()
 
-    print("Training new gesture model...")
-
-    training_result = subprocess.run(
-        ["python", "train_gesture_model.py"],
-        input="\n",
-        text=True
-    )
-
-    if training_result.returncode != 0:
-
-        print()
-        print("=" * 50)
-        print("MODEL TRAINING FAILED")
-        print("=" * 50)
-        print()
-
-        return False
-
-    print()
-    print("=" * 50)
-    print("MODEL TRAINING COMPLETE")
-    print("=" * 50)
-    print()
-
-    return True
-
-
-model_data = load_model()
-
-if model_data is None:
-    landmarker.close()
-    cap.release()
-    exit()
-
-
-print()
-print("=" * 50)
-print("Gesture Controller")
-print("=" * 50)
-print()
-print("Robot starts IDLE (no target).")
-print(f"Show a CLOSED FIST and hold it {PAIRING_HOLD_TIME:.0f}s to pair.")
-print("Once paired, FOLLOW / STOP / DOCK gestures")
-print("from the target are recognized; everyone")
-print("else's gestures are ignored.")
-print("Target gesturing DOCK relinquishes the")
-print("target and returns the robot to IDLE.")
-print("Press C to recalibrate (only while IDLE).")
-print("Press Q or ESC to quit.")
-print()
-
-
-# "IDLE": no target paired, waiting for someone to pair via closed fist.
-# "ACTIVE": a target is paired and being tracked/gestured to.
-state = "IDLE"
-target_position = None
-target_person_id = None
-
-pairing_fist_start_time = None
-
-candidate_gesture = None
-gesture_start_time = None
-confirmed_gesture = None
-rejection_start_time = None
-last_target_publish_time = 0.0
-
-
-while True:
-
-    ret, frame = cap.read()
-
-    if not ret:
-        print("Could not read camera")
-        break
-
-    frame = cv2.flip(frame, 1)
-
-    people = track_people(frame)
-    draw_people(frame, people, target_person_id)
-
-    rgb = cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2RGB
-    )
-
-    mp_image = mp.Image(
-        image_format=mp.ImageFormat.SRGB,
-        data=rgb
-    )
-
-    result = landmarker.detect(mp_image)
-
-    prediction = "No hand"
-    confidence = 0.0
-    distance = 0.0
-    threshold = 0.0
-    confirmation_progress = 0.0
-    pairing_progress = 0.0
-    is_target = False
-    current_person_id = None
-
-    if result.hand_landmarks:
-
-        hand = result.hand_landmarks[0]
-
-        draw_hand(frame, hand)
-
-        current_position = hand_position(hand)
-        fist_detected = is_closed_fist(hand)
-        current_person_id = hand_person_id(hand, people, frame.shape)
-
+        # =====================================================================
+        # STATE MACHINE: IDLE (Pairing Mode)
+        # =====================================================================
         if state == "IDLE":
+            cv2.putText(
+                frame,
+                "STATE: IDLE (Show Fist 3s to Pair)",
+                (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+            )
 
-            candidate_gesture = None
-            gesture_start_time = None
-            confirmed_gesture = None
+            if fist_detected:
+                if pairing_fist_start_time is None:
+                    pairing_fist_start_time = now
 
-            if fist_detected and current_person_id is not None:
+                held_time = now - pairing_fist_start_time
+                progress = min(held_time / PAIRING_HOLD_TIME, 1.0)
 
-                pairing_fist_start_time = (
-                    pairing_fist_start_time
-                    if pairing_fist_start_time is not None
-                    else time.time()
-                )
-
-                held_time = time.time() - pairing_fist_start_time
-
-                pairing_progress = min(
-                    held_time / PAIRING_HOLD_TIME,
-                    1.0
+                # Visual Progress Bar
+                cv2.rectangle(frame, (20, 50), (320, 70), (255, 255, 255), 2)
+                cv2.rectangle(frame, (20, 50), (20 + int(300 * progress), 70), (0, 255, 0), -1)
+                cv2.putText(
+                    frame,
+                    f"Pairing: {held_time:.1f}s",
+                    (330, 67),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
                 )
 
                 if held_time >= PAIRING_HOLD_TIME:
-
-                    # Lock the new target first, then recalibrate all three
-                    # learned gestures for that target. This is used both for
-                    # the first target and after DOCK releases the previous
-                    # target.
+                    target_person_id = current_pid
                     state = "ACTIVE"
-                    target_position = current_position
-                    target_person_id = current_person_id
                     pairing_fist_start_time = None
+                    print(f"\n[OK] TARGET PAIRED! Person ID: {target_person_id}")
 
-                    print()
-                    print("=" * 40)
-                    print("TARGET PAIRED")
-                    print("Starting gesture recalibration...")
-                    print("=" * 40)
-                    print()
-
-                    success = run_calibration()
-
-                    if not success:
-                        state = "IDLE"
-                        target_position = None
-                        target_person_id = None
-                        candidate_gesture = None
-                        gesture_start_time = None
-                        confirmed_gesture = None
-                        pairing_fist_start_time = None
-                        break
-
-                    model_data = load_model()
-
+                    # If model not trained yet, trigger automatic calibration
                     if model_data is None:
-                        state = "IDLE"
-                        target_position = None
-                        target_person_id = None
-                        candidate_gesture = None
-                        gesture_start_time = None
-                        confirmed_gesture = None
-                        pairing_fist_start_time = None
-                        break
-
-                    candidate_gesture = None
-                    gesture_start_time = None
-                    confirmed_gesture = None
-
-                    print()
-                    print("=" * 50)
-                    print("NEW GESTURE MODEL LOADED")
-                    print("Returning to ACTIVE mode.")
-                    print("=" * 50)
-                    print()
-
+                        success = run_calibration(cap, landmarker, person_tracker)
+                        if success and os.path.exists(MODEL_PATH):
+                            model_data = joblib.load(MODEL_PATH)
+                            print("[OK] Calibration complete. Ready for control.")
             else:
                 pairing_fist_start_time = None
 
-        else:  # state == "ACTIVE"
-
-            # Target identity is now supplied by the person tracker.
-            # MAX_TARGET_DISTANCE remains defined above for compatibility,
-            # but it is no longer used to decide who may issue commands.
-            is_target = (
-                current_person_id is not None and
-                current_person_id == target_person_id
+        # =====================================================================
+        # STATE MACHINE: ACTIVE (Tracking & Following Mode)
+        # =====================================================================
+        elif state == "ACTIVE":
+            cv2.putText(
+                frame,
+                f"STATE: ACTIVE (Target ID: {target_person_id})",
+                (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
             )
 
-            if is_target:
-                target_box = next(
-                    (
-                        person["box"]
-                        for person in people
-                        if person["id"] == target_person_id
-                    ),
-                    None
+            # Locate target bounding box and publish coordinates
+            target_box = next((p["box"] for p in people if p["id"] == target_person_id), None)
+            if target_box is not None:
+                bx1, by1, bx2, by2 = target_box
+                box_h = max(1.0, by2 - by1)
+                box_cx = (bx1 + bx2) / 2.0
+
+                # Monocular distance estimate
+                dist = (ASSUMED_PERSON_HEIGHT_METERS * CAMERA_FOCAL_LENGTH_PIXELS) / box_h
+                dist = max(MIN_TARGET_DISTANCE, min(MAX_TARGET_DISTANCE, dist))
+                offset_x = box_cx - (w / 2.0)
+                angle = math.atan2(-offset_x, CAMERA_FOCAL_LENGTH_PIXELS)
+
+                target_x = dist * math.cos(angle)
+                target_y = dist * math.sin(angle)
+
+                if now - last_target_publish_time >= TARGET_PUBLISH_INTERVAL:
+                    target_msg = json.dumps({"x": round(target_x, 3), "y": round(target_y, 3)}) + "\n"
+                    target_client.send(target_msg)
+                    last_target_publish_time = now
+
+                cv2.putText(
+                    frame,
+                    f"Dist: {dist:.2f}m | Angle: {math.degrees(angle):.1f} deg",
+                    (20, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),
+                    2,
                 )
 
-                current_time = time.time()
+            # Classify gestures ONLY if the hand belongs to the paired target
+            is_target_hand = (current_pid is not None and current_pid == target_person_id)
 
-                if (
-                    target_box is not None and
-                    current_time - last_target_publish_time
-                    >= TARGET_PUBLISH_INTERVAL
-                ):
-                    send_target_to_ros(
-                        target_box,
-                        frame.shape
-                    )
-                    last_target_publish_time = current_time
+            if hand_detected and is_target_hand and model_data is not None:
+                pred, conf, dist_metric, thresh = predict_gesture(hand, model_data)
 
-
-                target_position = current_position
-
-                prediction, confidence, distance, threshold = (
-                    predict_gesture(hand, model_data)
+                cv2.putText(
+                    frame,
+                    f"Gesture: {pred} ({conf*100:.0f}%)",
+                    (20, 95),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0) if pred in GESTURES else (0, 0, 255),
+                    2,
                 )
 
-                current_time = time.time()
-
-                if prediction in GESTURES:
-
-                    # Tolerate a brief classifier dropout without restarting
-                    # the 1-second confirmation timer.
+                if pred in GESTURES:
                     rejection_start_time = None
-
-                    if prediction != candidate_gesture:
-                        candidate_gesture = prediction
-                        gesture_start_time = current_time
-
-                        if confirmed_gesture != prediction:
-                            confirmed_gesture = None
-
+                    if pred != candidate_gesture:
+                        candidate_gesture = pred
+                        gesture_start_time = now
                     else:
-                        if gesture_start_time is not None:
-                            confirmation_progress = (
-                                current_time - gesture_start_time
-                            )
+                        elapsed = now - (gesture_start_time or now)
+                        if elapsed >= GESTURE_CONFIRMATION_TIME:
+                            if confirmed_gesture != pred:
+                                confirmed_gesture = pred
+                                print(f"[COMMAND CONFIRMED] -> {pred}")
+                                gesture_client.send(pred + "\n")
 
-                            if confirmation_progress >= GESTURE_CONFIRMATION_TIME:
-                                if confirmed_gesture != prediction:
-                                    confirmed_gesture = prediction
-
-                                    print()
-                                    print("=" * 40)
-                                    print(f"COMMAND CONFIRMED: {prediction}")
-                                    print("=" * 40)
-                                    print()
-
-                                    send_gesture_to_ros(prediction)
-
-                                    if prediction == "DOCK":
-                                        print()
-                                        print("=" * 50)
-                                        print("DOCK confirmed.")
-                                        print("Relinquishing target.")
-                                        print("Returning to IDLE.")
-                                        print("=" * 50)
-                                        print()
-
-                                        state = "IDLE"
-                                        target_position = None
-                                        target_person_id = None
-                                        candidate_gesture = None
-                                        gesture_start_time = None
-                                        confirmed_gesture = None
-                                        rejection_start_time = None
-                                        pairing_fist_start_time = None
-
+                                if pred == "DOCK":
+                                    print("[INFO] DOCK received. Releasing target.")
+                                    state = "IDLE"
+                                    target_person_id = None
+                                    confirmed_gesture = None
                 else:
-                    # A single rejected frame no longer resets confirmation.
-                    # Reset only if rejection lasts longer than the grace period.
                     if candidate_gesture is not None:
                         if rejection_start_time is None:
-                            rejection_start_time = current_time
-
-                        if current_time - rejection_start_time > REJECTION_GRACE_TIME:
+                            rejection_start_time = now
+                        if now - rejection_start_time > REJECTION_GRACE_TIME:
                             candidate_gesture = None
                             gesture_start_time = None
-                            confirmed_gesture = None
-                            rejection_start_time = None
-                    else:
-                        rejection_start_time = None
-
-            else:
-                candidate_gesture = None
-                gesture_start_time = None
-
-    else:
-
-        if state == "IDLE":
-            pairing_fist_start_time = None
-        else:
-            candidate_gesture = None
-            gesture_start_time = None
-
-
-    # ---- overlay drawing ----
-
-    if state == "IDLE":
-
-        put_text(frame, "STATE: IDLE (no target)", 40, 0.8)
-
-        if pairing_fist_start_time is not None:
-
-            held_time = time.time() - pairing_fist_start_time
-
-            put_text(
-                frame,
-                f"Pairing hold: {held_time:.1f} / {PAIRING_HOLD_TIME:.1f} sec",
-                80,
-                0.7
-            )
-
-            bar_x, bar_y, bar_width, bar_height = 20, 110, 400, 30
-
-            cv2.rectangle(
-                frame,
-                (bar_x, bar_y),
-                (bar_x + bar_width, bar_y + bar_height),
-                (255, 255, 255),
-                2
-            )
-
-            cv2.rectangle(
-                frame,
-                (bar_x, bar_y),
-                (
-                    bar_x + int(bar_width * pairing_progress),
-                    bar_y + bar_height
-                ),
-                (0, 255, 0),
-                -1
-            )
-
-        else:
-            put_text(
-                frame,
-                "Show CLOSED FIST for 3s to pair",
-                80,
-                0.6
-            )
-
-        put_text(
-            frame,
-            "Press C to recalibrate (idle only)",
-            115,
-            0.55
-        )
-
-    else:
-
-        if is_target:
-
-            put_text(frame, "STATE: ACTIVE - target locked", 40, 0.8)
-            put_text(frame, f"Target ID: {target_person_id}", 70, 0.6)
-            put_text(frame, f"Prediction: {prediction}", 100, 0.7)
-            put_text(frame, f"Confidence: {confidence:.2f}", 130, 0.6)
-            put_text(frame, f"Distance: {distance:.3f}", 160, 0.6)
-            put_text(frame, f"Threshold: {threshold:.3f}", 190, 0.6)
-
-            if candidate_gesture is not None:
-
-                progress = min(
-                    confirmation_progress / GESTURE_CONFIRMATION_TIME,
-                    1.0
-                )
-
-                put_text(
+            elif hand_detected and not is_target_hand:
+                cv2.putText(
                     frame,
-                    f"Confirming: {candidate_gesture}",
-                    220,
-                    0.6
+                    "Hand Ignored: Not Paired Target",
+                    (20, 95),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2,
                 )
 
-                bar_x, bar_y, bar_width, bar_height = 20, 240, 400, 25
-
-                cv2.rectangle(
-                    frame,
-                    (bar_x, bar_y),
-                    (bar_x + bar_width, bar_y + bar_height),
-                    (255, 255, 255),
-                    2
-                )
-
-                cv2.rectangle(
-                    frame,
-                    (bar_x, bar_y),
-                    (
-                        bar_x + int(bar_width * progress),
-                        bar_y + bar_height
-                    ),
-                    (0, 255, 0),
-                    -1
-                )
-
-            if confirmed_gesture is not None:
-                put_text(frame, f"COMMAND: {confirmed_gesture}", 300, 0.75)
-
-        elif result.hand_landmarks:
-
-            put_text(frame, "STATE: ACTIVE - target locked", 40, 0.8)
-            put_text(frame, "Hand detected: NOT the target", 75, 0.7)
-            put_text(frame, "Gesture ignored", 105, 0.6)
-
-        else:
-
-            put_text(frame, "STATE: ACTIVE - target locked", 40, 0.8)
-            put_text(frame, "Target not visible", 75, 0.7)
-
-        put_text(
-            frame,
-            "Target gestures DOCK to release",
-            340,
-            0.55
-        )
-
-
-    cv2.imshow(
-        "Gesture Controller",
-        frame
-    )
-
-    key = cv2.waitKey(1) & 0xFF
-
-    if key == ord("q") or key == 27:
-        break
-
-    if key == ord("c") and state == "IDLE":
-
-        success = run_calibration()
-
-        if not success:
+        cv2.imshow("Gesture Controller", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q") or key == 27:
             break
+        elif key == ord("c") and state == "IDLE":
+            run_calibration(cap, landmarker, person_tracker)
+            if os.path.exists(MODEL_PATH):
+                model_data = joblib.load(MODEL_PATH)
 
-        model_data = load_model()
-
-        if model_data is None:
-            break
-
-        candidate_gesture = None
-        gesture_start_time = None
-        confirmed_gesture = None
-        pairing_fist_start_time = None
-
-        print()
-        print("=" * 50)
-        print("NEW MODEL LOADED")
-        print("Returning to IDLE.")
-        print("=" * 50)
-        print()
+    cap.release()
+    cv2.destroyAllWindows()
+    gesture_client.close()
+    target_client.close()
+    landmarker.close()
+    print("[INFO] Vision Controller exited cleanly.")
 
 
-cap.release()
-cv2.destroyAllWindows()
-landmarker.close()
-
-print()
-print("Gesture controller stopped.")
+if __name__ == "__main__":
+    main()

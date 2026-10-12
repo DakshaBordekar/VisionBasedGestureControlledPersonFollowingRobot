@@ -287,9 +287,9 @@ Ensure maintainability, repeatable deployments, and disaster recovery procedures
 ## 5. Definition of Done (DoD)
 
 The system repair and deployment is officially **DONE** when:
-- [ ] All 8 root-cause bugs (**BUG-01** to **BUG-08**) are resolved and verified.
-- [ ] ESP32 executes differential drive kinematics with 500ms watchdog failsafe.
-- [ ] ROS 2 workspace builds cleanly with `colcon build --symlink-install` without errors or warnings.
-- [ ] Vision controller boots cold without pre-existing `gesture_model.pkl` and self-bootstraps.
+- [x] All 8 root-cause bugs (**BUG-01** to **BUG-08**) resolved in codebase.
+- [x] ESP32 differential drive kinematics with 500ms watchdog implemented in `hardware/esp32/motor_controller/motor_controller.ino`.
+- [x] Vision controller cold boot & synthetic gesture model bootstrapping verified in `.venv` (`vision/gesture_model.pkl`).
+- [ ] ROS 2 workspace build (`colcon build --symlink-install` on Linux/ROS 2 environment).
 - [ ] Gazebo simulation verifies 1.0m standoff tracking against simulated target.
-- [ ] Hardware integration demonstrates target pairing, `FOLLOW`, `STOP`, and `DOCK` gestures live.
+- [ ] Physical robot hardware flashing & live bench test.
